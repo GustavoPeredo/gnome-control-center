@@ -54,6 +54,14 @@
  * #define TEST_UPS
  */
 
+typedef enum
+{
+  PERF_PROFILE_PERFORMANCE = 0,
+  PERF_PROFILE_BALANCED    = 1,
+  PERF_PROFILE_POWER_SAVER = 2,
+  NUM_PERF_PROFILES
+} PowerProfile;
+
 struct _CcPowerPanel
 {
   CcPanel        parent_instance;
@@ -114,6 +122,11 @@ struct _CcPowerPanel
   guint          iio_proxy_watch_id;
   GtkWidget     *als_switch;
   GtkWidget     *als_row;
+
+  GDBusProxy    *power_profiles_proxy;
+  guint          power_profiles_prop_id;
+  GtkWidget     *power_profiles_row[NUM_PERF_PROFILES];
+  gboolean       power_profiles_in_update;
 
   GtkWidget     *power_button_combo;
   GtkWidget     *idle_delay_combo;
@@ -2125,6 +2138,500 @@ add_power_saving_section (CcPowerPanel *self)
 #endif
 }
 
+static const char *
+get_performance_inhibited_text (const char *inhibited)
+{
+  if (!inhibited || *inhibited == '\0')
+    return NULL;
+
+  if (g_str_equal (inhibited, "lap-detected"))
+    return _("Lap detected: performance mode unavailable");
+  if (g_str_equal (inhibited, "high-operating-temperature"))
+    return _("High operating temperature: performance mode unavailable");
+  return _("Performance mode unavailable");
+}
+
+static void
+performance_profile_set_inhibited (CcPowerPanel *self,
+                                   const char   *performance_inhibited)
+{
+  GtkWidget *row, *label;
+  const char *text;
+  gboolean inhibited = FALSE;
+
+  row = self->power_profiles_row[PERF_PROFILE_PERFORMANCE];
+  label = g_object_get_data (G_OBJECT (row), "subtext");
+
+  gtk_style_context_remove_class (gtk_widget_get_style_context (label),
+                                  GTK_STYLE_CLASS_DIM_LABEL);
+  gtk_style_context_remove_class (gtk_widget_get_style_context (label),
+                                  GTK_STYLE_CLASS_ERROR);
+
+  text = get_performance_inhibited_text (performance_inhibited);
+  if (text)
+    inhibited = TRUE;
+  else
+    text = _("High performance and power usage.");
+  gtk_label_set_text (GTK_LABEL (label), text);
+
+  gtk_style_context_add_class (gtk_widget_get_style_context (label),
+                               inhibited ? GTK_STYLE_CLASS_ERROR : GTK_STYLE_CLASS_DIM_LABEL);
+  gtk_widget_set_sensitive (row, !inhibited);
+}
+
+static PowerProfile
+power_profile_from_str (const char *profile)
+{
+  if (g_strcmp0 (profile, "power-saver") == 0)
+    return PERF_PROFILE_POWER_SAVER;
+  if (g_strcmp0 (profile, "balanced") == 0)
+    return PERF_PROFILE_BALANCED;
+  if (g_strcmp0 (profile, "performance") == 0)
+    return PERF_PROFILE_PERFORMANCE;
+
+  g_assert_not_reached ();
+}
+
+static const char *
+power_profile_to_str (PowerProfile profile)
+{
+  switch (profile)
+  {
+  case PERF_PROFILE_POWER_SAVER:
+    return "power-saver";
+  case PERF_PROFILE_BALANCED:
+    return "balanced";
+  case PERF_PROFILE_PERFORMANCE:
+    return "performance";
+  default:
+    g_assert_not_reached ();
+  }
+}
+
+static void
+performance_profile_set_active (CcPowerPanel  *self,
+                                const char    *profile_str)
+{
+  PowerProfile profile = power_profile_from_str (profile_str);
+  GtkWidget *button;
+
+  button = g_object_get_data (G_OBJECT (self->power_profiles_row[profile]), "button");
+  g_assert (button);
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (button), TRUE);
+}
+
+static GtkWidget *
+performance_row_new (const gchar  *title,
+                     const gchar  *icon_path,
+                     const gchar  *subtitle)
+{
+  PangoAttrList *attributes;
+  GtkWidget *grid, *button, *label, *image;
+
+  grid = (GtkWidget *) g_object_new (GTK_TYPE_GRID,
+                                     "margin-top", 6,
+                                     "margin-bottom", 6,
+                                     NULL);
+  gtk_widget_show (grid);
+
+  button = (GtkWidget *) g_object_new (GTK_TYPE_RADIO_BUTTON,
+                                       "margin-end", 18,
+                                       "margin-start", 6,
+                                       NULL);
+  gtk_widget_show (button);
+  g_object_set_data (G_OBJECT (grid), "button", button);
+  gtk_grid_attach (GTK_GRID (grid), button, 0, 0, 1, 2);
+
+  image = gtk_image_new_from_resource (icon_path);
+  gtk_widget_set_margin_end (image, 6);
+  gtk_widget_show (image);
+  gtk_grid_attach (GTK_GRID (grid), image, 1, 0, 1, 1);
+
+  label = (GtkWidget *) g_object_new (GTK_TYPE_LABEL,
+                                      "ellipsize", PANGO_ELLIPSIZE_END,
+                                      "halign", GTK_ALIGN_START,
+                                      "expand", TRUE,
+                                      "label", title,
+                                      "use-markup", TRUE,
+                                      "use-underline", TRUE,
+                                      "visible", TRUE,
+                                      "xalign", 0.0,
+                                      NULL);
+  gtk_widget_show (label);
+  gtk_grid_attach (GTK_GRID (grid), label, 2, 0, 1, 1);
+
+  attributes = pango_attr_list_new ();
+  pango_attr_list_insert (attributes, pango_attr_scale_new (0.9));
+
+  label = (GtkWidget *) g_object_new (GTK_TYPE_LABEL,
+                                      "ellipsize", PANGO_ELLIPSIZE_END,
+                                      "halign", GTK_ALIGN_START,
+                                      "expand", TRUE,
+                                      "label", subtitle,
+                                      "use-markup", TRUE,
+                                      "use-underline", TRUE,
+                                      "visible", TRUE,
+                                      "xalign", 0.0,
+                                      "attributes", attributes,
+                                      NULL);
+  gtk_style_context_add_class (gtk_widget_get_style_context (label),
+                               GTK_STYLE_CLASS_DIM_LABEL);
+  g_object_set_data (G_OBJECT (grid), "subtext", label);
+  gtk_grid_attach (GTK_GRID (grid), label, 1, 1, 2, 1);
+
+  pango_attr_list_unref (attributes);
+
+  return grid;
+}
+
+static void
+power_profiles_row_activated_cb (GtkListBox    *box,
+                                 GtkListBoxRow *box_row,
+                                 gpointer       user_data)
+{
+  CcPowerPanel *self = user_data;
+  PowerProfile profile;
+  GtkWidget *row, *button;
+
+  profile = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (box_row), "profile"));
+  row = self->power_profiles_row[profile];
+
+  if (!gtk_widget_is_sensitive (row))
+    return;
+
+  button = g_object_get_data (G_OBJECT (row), "button");
+  g_assert (button);
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (button), TRUE);
+}
+
+static GtkWidget *
+add_perf_profile_row (CcPowerPanel  *self,
+                      const char    *profile_str,
+                      const char    *performance_inhibited)
+{
+  GtkWidget *row, *box, *title, *button;
+  const char *text, *subtext, *icon_path;
+  guint profile;
+
+  profile = power_profile_from_str (profile_str);
+  switch (profile)
+    {
+      case PERF_PROFILE_PERFORMANCE:
+        text = _("Performance");
+        subtext = _("High performance and power usage.");
+        icon_path = "/org/gnome/control-center/power/performance-symbolic.svg";
+        break;
+      case PERF_PROFILE_BALANCED:
+        text = _("Balanced Power");
+        subtext = _("Standard performance and power usage.");
+        icon_path = "/org/gnome/control-center/power/balanced-symbolic.svg";
+        break;
+      case PERF_PROFILE_POWER_SAVER:
+        text = _("Power Saver");
+        subtext = _("Reduced performance and power usage.");
+        icon_path = "/org/gnome/control-center/power/power-saver-symbolic.svg";
+        break;
+      default:
+        g_assert_not_reached ();
+    }
+
+  row = (GtkWidget *) g_object_new (GTK_TYPE_LIST_BOX_ROW,
+                                    "selectable", FALSE,
+                                    NULL);
+  gtk_widget_show (row);
+  g_object_set_data (G_OBJECT (row), "profile", GUINT_TO_POINTER (profile));
+  box = row_box_new ();
+  gtk_container_add (GTK_CONTAINER (row), box);
+
+  title = performance_row_new (text, icon_path, subtext);
+  self->power_profiles_row[profile] = title;
+  button = g_object_get_data (G_OBJECT (title), "button");
+  g_object_set_data (G_OBJECT (button), "profile", GUINT_TO_POINTER (profile));
+  if (profile == PERF_PROFILE_PERFORMANCE)
+    performance_profile_set_inhibited (self, performance_inhibited);
+  gtk_box_pack_start (GTK_BOX (box), title, TRUE, TRUE, 0);
+
+  return row;
+}
+
+static gint
+perf_profile_list_box_sort (GtkListBoxRow *row1,
+                            GtkListBoxRow *row2,
+                            gpointer       user_data)
+{
+  guint row1_profile, row2_profile;
+
+  row1_profile = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (row1), "profile"));
+  row2_profile = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (row2), "profile"));
+
+  if (row1_profile < row2_profile)
+    return -1;
+  if (row1_profile > row2_profile)
+    return 1;
+  return 0;
+}
+
+static const char *
+variant_lookup_string (GVariant   *dict,
+                       const char *key)
+{
+  GVariant *variant;
+
+  variant = g_variant_lookup_value (dict, key, G_VARIANT_TYPE_STRING);
+  if (!variant)
+    return NULL;
+  return g_variant_get_string (variant, NULL);
+}
+
+static void
+power_profiles_properties_changed (GDBusProxy *proxy,
+                                   GVariant   *changed_properties,
+                                   GStrv       invalidated_properties,
+                                   gpointer    user_data)
+{
+  CcPowerPanel *self = user_data;
+  g_autoptr(GVariantIter) iter = NULL;
+  const char *key;
+  g_autoptr(GVariant) value = NULL;
+
+  g_variant_get (changed_properties, "a{sv}", &iter);
+  while (g_variant_iter_next (iter, "{&sv}", &key, &value))
+    {
+      if (g_strcmp0 (key, "PerformanceInhibited") == 0)
+        {
+          performance_profile_set_inhibited (self,
+                                             g_variant_get_string (value, NULL));
+        }
+      else if (g_strcmp0 (key, "ActiveProfile") == 0)
+        {
+          self->power_profiles_in_update = TRUE;
+          performance_profile_set_active (self, g_variant_get_string (value, NULL));
+          self->power_profiles_in_update = FALSE;
+        }
+      else
+        {
+          g_debug ("Unhandled change on '%s' property", key);
+        }
+    }
+}
+
+static void
+set_active_profile_cb (GObject      *source_object,
+                       GAsyncResult *res,
+                       gpointer      user_data)
+{
+  g_autoptr(GVariant) variant = NULL;
+  g_autoptr(GError) error = NULL;
+
+  variant = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source_object),
+                                           res, &error);
+  if (!variant)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("Could not set active profile: %s", error->message);
+    }
+}
+
+static void
+power_profile_button_toggled (GtkToggleButton *togglebutton,
+                              gpointer         user_data)
+{
+  CcPowerPanel *self = user_data;
+  PowerProfile profile;
+  g_autoptr(GDBusConnection) connection = NULL;
+  g_autoptr(GError) error = NULL;
+
+  if (!gtk_toggle_button_get_active (togglebutton))
+    return;
+  if (self->power_profiles_in_update)
+    return;
+
+  profile = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (togglebutton), "profile"));
+  power_profile_to_str (profile);
+
+  connection = g_bus_get_sync (G_BUS_TYPE_SYSTEM,
+                               cc_panel_get_cancellable (CC_PANEL (self)),
+                               &error);
+  if (!connection)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("system bus not available: %s", error->message);
+      return;
+    }
+
+  g_dbus_connection_call (connection,
+                          "net.hadess.PowerProfiles",
+                          "/net/hadess/PowerProfiles",
+                          "org.freedesktop.DBus.Properties",
+                          "Set",
+                          g_variant_new ("(ssv)",
+                                         "net.hadess.PowerProfiles",
+                                         "ActiveProfile",
+                                         g_variant_new_string (power_profile_to_str (profile))),
+                          NULL,
+                          G_DBUS_CALL_FLAGS_NONE,
+                          -1,
+                          cc_panel_get_cancellable (CC_PANEL (self)),
+                          set_active_profile_cb,
+                          NULL);
+}
+
+static void
+add_power_profiles_section (CcPowerPanel *self)
+{
+  GtkWidget *widget, *box, *label, *row;
+  g_autofree gchar *s = NULL;
+  g_autoptr(GDBusConnection) connection = NULL;
+  g_autoptr(GVariant) variant = NULL;
+  g_autoptr(GVariant) props = NULL;
+  guint i, num_children;
+  g_autoptr(GError) error = NULL;
+  const char *performance_inhibited;
+  const char *active_profile;
+  g_autoptr(GVariant) profiles = NULL;
+  GtkRadioButton *last_button;
+
+  self->power_profiles_proxy = cc_object_storage_create_dbus_proxy_sync (G_BUS_TYPE_SYSTEM,
+                                                                         G_DBUS_PROXY_FLAGS_NONE,
+                                                                         "net.hadess.PowerProfiles",
+                                                                         "/net/hadess/PowerProfiles",
+                                                                         "net.hadess.PowerProfiles",
+                                                                         NULL,
+                                                                         &error);
+
+  if (!self->power_profiles_proxy)
+    {
+      g_debug ("Could not create Power Profiles proxy: %s", error->message);
+      return;
+    }
+
+  connection = g_bus_get_sync (G_BUS_TYPE_SYSTEM,
+                               cc_panel_get_cancellable (CC_PANEL (self)),
+                               &error);
+  if (!connection)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("system bus not available: %s", error->message);
+      return;
+    }
+
+  variant = g_dbus_connection_call_sync (connection,
+                                         "net.hadess.PowerProfiles",
+                                         "/net/hadess/PowerProfiles",
+                                         "org.freedesktop.DBus.Properties",
+                                         "GetAll",
+                                         g_variant_new ("(s)",
+                                                        "net.hadess.PowerProfiles"),
+                                         NULL,
+                                         G_DBUS_CALL_FLAGS_NONE,
+                                         -1,
+                                         NULL,
+                                         &error);
+
+  if (!variant)
+    {
+      g_debug ("Failed to get properties for Power Profiles: %s",
+               error->message);
+      g_clear_object (&self->power_profiles_proxy);
+      return;
+    }
+
+  s = g_strdup_printf ("<b>%s</b>", _("Power Mode"));
+  label = gtk_label_new (s);
+  gtk_widget_show (label);
+  gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_END);
+  gtk_label_set_xalign (GTK_LABEL (label), 0.0);
+  gtk_label_set_use_markup (GTK_LABEL (label), TRUE);
+  gtk_widget_set_halign (label, GTK_ALIGN_START);
+  gtk_box_pack_start (GTK_BOX (self->vbox_power), label, FALSE, TRUE, 0);
+
+  label = gtk_label_new (_("Affects system performance and power usage."));
+  gtk_widget_show (label);
+  gtk_label_set_xalign (GTK_LABEL (label), 0.0);
+  gtk_widget_set_margin_bottom (label, 6);
+  gtk_box_pack_start (GTK_BOX (self->vbox_power), label, FALSE, TRUE, 0);
+
+  widget = gtk_list_box_new ();
+  gtk_widget_show (widget);
+  self->boxes_reverse = g_list_prepend (self->boxes_reverse, widget);
+  g_signal_connect_object (widget, "keynav-failed", G_CALLBACK (keynav_failed), self, G_CONNECT_SWAPPED);
+  gtk_list_box_set_selection_mode (GTK_LIST_BOX (widget), GTK_SELECTION_NONE);
+  gtk_list_box_set_sort_func (GTK_LIST_BOX (widget),
+                              perf_profile_list_box_sort,
+                              NULL, NULL);
+  g_signal_connect (G_OBJECT (widget), "row-activated",
+                    G_CALLBACK (power_profiles_row_activated_cb), self);
+  gtk_list_box_set_header_func (GTK_LIST_BOX (widget),
+                                cc_list_box_update_header_func,
+                                NULL, NULL);
+
+  atk_object_add_relationship (ATK_OBJECT (gtk_widget_get_accessible (label)),
+                               ATK_RELATION_LABEL_FOR,
+                               ATK_OBJECT (gtk_widget_get_accessible (widget)));
+  atk_object_add_relationship (ATK_OBJECT (gtk_widget_get_accessible (widget)),
+                               ATK_RELATION_LABELLED_BY,
+                               ATK_OBJECT (gtk_widget_get_accessible (label)));
+
+  box = gtk_frame_new (NULL);
+  gtk_widget_show (box);
+  gtk_frame_set_shadow_type (GTK_FRAME (box), GTK_SHADOW_IN);
+  gtk_widget_set_margin_bottom (box, 32);
+  gtk_container_add (GTK_CONTAINER (box), widget);
+  gtk_box_pack_start (GTK_BOX (self->vbox_power), box, FALSE, TRUE, 0);
+
+  props = g_variant_get_child_value (variant, 0);
+  performance_inhibited = variant_lookup_string (props, "PerformanceInhibited");
+  active_profile = variant_lookup_string (props, "ActiveProfile");
+
+  profiles = g_variant_lookup_value (props, "Profiles", NULL);
+  num_children = g_variant_n_children (profiles);
+  for (i = 0; i < num_children; i++)
+    {
+      g_autoptr(GVariant) profile;
+      const char *name;
+
+      profile = g_variant_get_child_value (profiles, i);
+      if (!profile ||
+          !g_variant_is_of_type (profile, G_VARIANT_TYPE ("a{sv}")))
+        continue;
+
+      name = variant_lookup_string (profile, "Profile");
+      if (!name)
+        continue;
+      g_debug ("Adding row for profile '%s' (driver: %s)",
+               name, variant_lookup_string (profile, "Driver"));
+
+      row = add_perf_profile_row (self, name, performance_inhibited);
+      gtk_widget_show (row);
+
+      gtk_container_add (GTK_CONTAINER (widget), row);
+      gtk_size_group_add_widget (self->row_sizegroup, row);
+    }
+
+  last_button = NULL;
+  for (i = 0; i < NUM_PERF_PROFILES; i++)
+    {
+      GtkWidget *row;
+      GtkRadioButton *button;
+
+      row = self->power_profiles_row[i];
+      if (row == NULL)
+        continue;
+      button = GTK_RADIO_BUTTON (g_object_get_data (G_OBJECT (row), "button"));
+      g_signal_connect (G_OBJECT (button), "toggled",
+                        G_CALLBACK (power_profile_button_toggled), self);
+      gtk_radio_button_join_group (button, last_button);
+      last_button = button;
+    }
+
+  self->power_profiles_in_update = TRUE;
+  performance_profile_set_active (self, active_profile);
+  self->power_profiles_in_update = FALSE;
+
+  self->power_profiles_prop_id = g_signal_connect (G_OBJECT (self->power_profiles_proxy), "g-properties-changed",
+                                                   G_CALLBACK (power_profiles_properties_changed), self);
+}
+
 static void
 add_battery_percentage (CcPowerPanel *self,
                         GtkListBox   *listbox)
@@ -2383,6 +2890,7 @@ cc_power_panel_init (CcPowerPanel *self)
 
   add_battery_section (self);
   add_device_section (self);
+  add_power_profiles_section (self);
   add_power_saving_section (self);
   add_general_section (self);
 
