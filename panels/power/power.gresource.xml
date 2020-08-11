@@ -2,6 +2,9 @@
 <gresources>
   <gresource prefix="/org/gnome/control-center/power">
     <file preprocess="xml-stripblanks">cc-power-panel.ui</file>
+    <file alias="power-saver-symbolic.svg">icons/scalable/power-saver-symbolic.svg</file>
+    <file alias="balanced-symbolic.svg">icons/scalable/balanced-symbolic.svg</file>
+    <file alias="performance-symbolic.svg">icons/scalable/performance-symbolic.svg</file>
     <file>battery-levels.css</file>
   </gresource>
 </gresources>

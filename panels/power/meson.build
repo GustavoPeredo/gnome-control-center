@@ -26,7 +26,12 @@ sources += gnome.mkenums_simple(
   'cc-brightness-scale-types',
   sources: ['cc-brightness-scale.h'])
 
-resource_data = files('cc-power-panel.ui')
+resource_data = files(
+  'cc-power-panel.ui',
+  'icons/scalable/balanced-symbolic.svg',
+  'icons/scalable/performance-symbolic.svg',
+  'icons/scalable/power-saver-symbolic.svg',
+)
 
 sources += gnome.compile_resources(
   'cc-' + cappletname + '-resources',
